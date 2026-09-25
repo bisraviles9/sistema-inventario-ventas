@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import sqlite3
 import unicodedata
+from calendar import monthrange
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -135,6 +136,62 @@ def save_product(sku, name, category, cost, price, stock, min_stock):
                min_stock=excluded.min_stock, updated_at=excluded.updated_at""",
             (sku.strip(), name.strip(), category.strip(), float(cost), float(price), int(stock), int(min_stock), now, now),
         )
+
+
+def seed_demo_august():
+    """Load fictional August 2026 electrical-accessories data into an empty database."""
+    products = [
+        ("ELE-001", "Cinta aislante 20 m", "Accesorios eléctricos", 1.20, 2.00, 15, 10, 35),
+        ("ELE-002", "Tomacorriente doble", "Accesorios eléctricos", 2.50, 4.00, 18, 12, 22),
+        ("ELE-003", "Interruptor sencillo", "Accesorios eléctricos", 1.50, 2.80, 20, 10, 25),
+        ("ELE-004", "Foco LED 12 W", "Iluminación", 2.00, 3.50, 18, 15, 42),
+        ("ELE-005", "Enchufe macho", "Accesorios eléctricos", 1.20, 2.50, 17, 10, 18),
+        ("ELE-006", "Extensión 5 m", "Accesorios eléctricos", 5.50, 9.00, 7, 8, 8),
+        ("ELE-007", "Breaker 20 A", "Protección eléctrica", 4.50, 7.50, 10, 12, 10),
+        ("ELE-008", "Canaleta PVC 2 m", "Instalación", 3.20, 5.50, 12, 10, 13),
+        ("ELE-009", "Cable THHN 10 m", "Cableado", 6.00, 9.50, 12, 8, 6),
+        ("ELE-010", "Multicontacto 4 salidas", "Accesorios eléctricos", 4.00, 7.00, 8, 10, 12),
+    ]
+    sale_dates = ["2026-08-03", "2026-08-10", "2026-08-17", "2026-08-24", "2026-08-31"]
+    payment_methods = ["Efectivo", "Transferencia", "Tarjeta", "Efectivo", "Otro"]
+    with db_connection() as conn:
+        if conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] or conn.execute("SELECT COUNT(*) FROM sales").fetchone()[0]:
+            raise ValueError("La demo solo se carga cuando el inventario está vacío.")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now = datetime.now().isoformat(timespec="seconds")
+            product_ids = {}
+            for sku, name, category, cost, price, stock, min_stock, _sold in products:
+                cur = conn.execute(
+                    "INSERT INTO products(sku,name,category,cost,price,stock,min_stock,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (sku, name, category, cost, price, stock, min_stock, now, now),
+                )
+                product_ids[sku] = cur.lastrowid
+            for week_index, day in enumerate(sale_dates):
+                line_items = []
+                for sku, name, _category, _cost, price, _stock, _min_stock, sold in products:
+                    base, remainder = divmod(sold, len(sale_dates))
+                    quantity = base + (1 if week_index < remainder else 0)
+                    if quantity:
+                        line_items.append((sku, name, quantity, price))
+                total = round(sum(quantity * price for _sku, _name, quantity, price in line_items), 2)
+                cur = conn.execute(
+                    "INSERT INTO sales(sold_at,customer,payment_method,total) VALUES(?,?,?,?)",
+                    (f"{day}T12:00:00", "Cliente de ejemplo", payment_methods[week_index], total),
+                )
+                sale_id = cur.lastrowid
+                for sku, name, quantity, price in line_items:
+                    conn.execute(
+                        "INSERT INTO sale_items(sale_id,product_id,sku,product_name,quantity,unit_price,subtotal) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (sale_id, product_ids[sku], sku, name, quantity, price, round(quantity * price, 2)),
+                    )
+            conn.commit()
+            return len(products), len(sale_dates), round(sum(row[4] * row[7] for row in products), 2)
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def record_sale(cart, customer, payment_method):
@@ -285,53 +342,81 @@ def make_template():
 init_db()
 st.title("📦 Inventario y ventas")
 st.caption("Control de productos, ventas y existencias · Moneda: USD")
+notice = st.session_state.pop("demo_loaded_notice", None)
+if notice:
+    st.success(notice)
 
 tab_dashboard, tab_products, tab_sales, tab_excel = st.tabs(["Dashboard", "Productos", "Ventas", "Excel"])
 
 with tab_dashboard:
     products = read_products()
     sales_all = read_sales()
-    details_all = read_sale_details()
     today = date.today()
-    month_sales = sales_all[sales_all["sold_at"].str[:7] == today.strftime("%Y-%m")] if not sales_all.empty else sales_all
+    month_names = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    available_months = sorted(sales_all["sold_at"].dropna().str[:7].unique().tolist(), reverse=True) if not sales_all.empty else []
+    current_month = today.strftime("%Y-%m")
+    if not available_months:
+        available_months = [current_month]
+    month_choice = st.selectbox(
+        "Mes del dashboard",
+        available_months,
+        index=0,
+        format_func=lambda value: f"{month_names[int(value[5:7]) - 1].capitalize()} {value[:4]}",
+    )
+    year, month = (int(part) for part in month_choice.split("-"))
+    month_start = date(year, month, 1)
+    month_end = date(year, month, monthrange(year, month)[1])
+    month_label = f"{month_names[month - 1].capitalize()} {year}"
+    month_sales = sales_all[sales_all["sold_at"].str[:7] == month_choice] if not sales_all.empty else sales_all
+    details_month = read_sale_details(month_start, month_end)
     revenue_month = float(month_sales["total"].sum()) if not month_sales.empty else 0.0
     stock_units = int(products["Stock"].sum()) if not products.empty else 0
     stock_value = float((products["Stock"] * products["Precio compra"]).sum()) if not products.empty else 0.0
     low = products[products["Stock"] <= products["Stock mínimo"]] if not products.empty else products
+
+    if products.empty and sales_all.empty:
+        st.info("La app está vacía. Puedes cargar una demostración ficticia de accesorios eléctricos.")
+        if st.button("Cargar demo de accesorios eléctricos · agosto 2026", type="primary"):
+            try:
+                products_added, sales_added, demo_total = seed_demo_august()
+                st.session_state["demo_loaded_notice"] = f"Demo lista: {products_added} productos y {sales_added} ventas por ${demo_total:,.2f}."
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Productos registrados", f"{len(products):,}")
     c2.metric("Unidades en inventario", f"{stock_units:,}")
-    c3.metric("Ventas del mes", f"${revenue_month:,.2f}")
+    c3.metric(f"Ventas · {month_label}", f"${revenue_month:,.2f}")
     c4.metric("Productos con stock bajo", f"{len(low):,}")
-    st.caption(f"Valor del inventario al costo: ${stock_value:,.2f}")
+    st.caption(f"Valor del inventario al costo: ${stock_value:,.2f} · Datos de ventas del mes seleccionado")
     left, right = st.columns(2)
     with left:
-        st.subheader("Ventas de los últimos 30 días")
-        if not sales_all.empty:
-            chart = sales_all.copy()
+        st.subheader(f"Ventas por semana · {month_label}")
+        if not month_sales.empty:
+            chart = month_sales.copy()
             chart["Fecha"] = pd.to_datetime(chart["sold_at"]).dt.date
-            chart = chart[chart["Fecha"] >= today.fromordinal(today.toordinal() - 29)]
             trend = chart.groupby("Fecha", as_index=False)["total"].sum().set_index("Fecha")
             st.line_chart(trend)
         else:
-            st.info("Aún no hay ventas registradas.")
+            st.info("No hay ventas registradas en este mes.")
     with right:
-        st.subheader("Productos más vendidos")
-        if not details_all.empty:
-            top = details_all.groupby("Producto", as_index=False)["Cantidad"].sum().sort_values("Cantidad", ascending=False).head(8)
+        st.subheader(f"Productos más vendidos · {month_label}")
+        if not details_month.empty:
+            top = details_month.groupby("Producto", as_index=False)["Cantidad"].sum().sort_values("Cantidad", ascending=False).head(8)
             st.bar_chart(top.set_index("Producto"))
         else:
-            st.info("El gráfico aparecerá cuando registres ventas.")
+            st.info("El gráfico aparecerá cuando registres ventas en este mes.")
     st.subheader("Alertas de stock")
     if low.empty:
         st.success("No hay productos bajo el stock mínimo.")
     else:
         st.dataframe(low[["SKU", "Nombre", "Categoría", "Stock", "Stock mínimo"]], use_container_width=True, hide_index=True)
-    st.subheader("Ventas recientes")
-    if sales_all.empty:
-        st.info("Todavía no se han registrado ventas.")
+    st.subheader(f"Ventas de {month_label}")
+    if month_sales.empty:
+        st.info("Todavía no hay ventas para el mes seleccionado.")
     else:
-        recent = sales_all.head(8).rename(columns={"id": "Venta", "sold_at": "Fecha", "customer": "Cliente", "payment_method": "Forma de pago", "total": "Total USD"})
+        recent = month_sales.head(8).rename(columns={"id": "Venta", "sold_at": "Fecha", "customer": "Cliente", "payment_method": "Forma de pago", "total": "Total USD"})
         st.dataframe(recent, use_container_width=True, hide_index=True)
 
 with tab_products:
@@ -417,7 +502,7 @@ with tab_sales:
                     st.rerun()
     st.divider()
     st.subheader("Historial de ventas")
-    start_date, end_date = st.date_input("Filtrar fechas", value=(date.today().replace(day=1), date.today()), key="sales_dates")
+    start_date, end_date = st.date_input("Filtrar fechas", value=(month_start, month_end), key="sales_dates")
     sales = read_sales(start_date, end_date)
     if sales.empty:
         st.info("No hay ventas en ese rango de fechas.")
@@ -439,7 +524,7 @@ with tab_excel:
             st.error(f"No se pudo importar el archivo: {exc}")
     st.divider()
     st.subheader("Exportar reportes")
-    export_start, export_end = st.date_input("Rango para ventas exportadas", value=(date.today().replace(day=1), date.today()), key="export_dates")
+    export_start, export_end = st.date_input("Rango para ventas exportadas", value=(month_start, month_end), key="export_dates")
     workbook = make_export(export_start, export_end)
     st.download_button("Descargar reporte Excel", data=workbook, file_name=f"reporte_inventario_{date.today().isoformat()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.caption("El Excel incluye hojas de Productos, Ventas, Detalle de ventas y Stock bajo.")
