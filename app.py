@@ -194,6 +194,64 @@ def seed_demo_august():
             raise
 
 
+def extend_demo_through_today():
+    """Add fictional monthly sales from January through September 2026 to the August demo."""
+    base_sold = {
+        "ELE-001": 35, "ELE-002": 22, "ELE-003": 25, "ELE-004": 42, "ELE-005": 18,
+        "ELE-006": 8, "ELE-007": 10, "ELE-008": 13, "ELE-009": 6, "ELE-010": 12,
+    }
+    monthly_factors = {1: 0.65, 2: 0.70, 3: 0.78, 4: 0.75, 5: 0.90, 6: 0.95, 7: 1.05, 9: 0.80}
+    sale_days = (4, 11, 18, 25)
+    payment_methods = ["Efectivo", "Transferencia", "Tarjeta", "Otro"]
+    expected_skus = set(base_sold)
+    with db_connection() as conn:
+        existing_skus = {row[0] for row in conn.execute("SELECT sku FROM products")}
+        existing_months = {str(row[0])[:7] for row in conn.execute("SELECT DISTINCT sold_at FROM sales")}
+        if existing_skus != expected_skus or existing_months != {"2026-08"}:
+            raise ValueError("La ampliación solo funciona con la demo original de agosto y no se puede repetir.")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            product_map = {
+                row["sku"]: row
+                for row in conn.execute("SELECT id, sku, name, price FROM products")
+            }
+            added_sales = 0
+            added_total = 0.0
+            for month, factor in monthly_factors.items():
+                monthly_quantities = {
+                    sku: max(1, int(round(quantity * factor)))
+                    for sku, quantity in base_sold.items()
+                }
+                for week_index, day in enumerate(sale_days):
+                    line_items = []
+                    for sku, month_quantity in monthly_quantities.items():
+                        base, remainder = divmod(month_quantity, len(sale_days))
+                        quantity = base + (1 if week_index < remainder else 0)
+                        if quantity:
+                            product = product_map[sku]
+                            line_items.append((sku, product["id"], product["name"], quantity, float(product["price"])))
+                    total = round(sum(quantity * price for _sku, _pid, _name, quantity, price in line_items), 2)
+                    sold_at = date(2026, month, day).isoformat() + "T12:00:00"
+                    cur = conn.execute(
+                        "INSERT INTO sales(sold_at,customer,payment_method,total) VALUES(?,?,?,?)",
+                        (sold_at, "Cliente de ejemplo", payment_methods[week_index], total),
+                    )
+                    sale_id = cur.lastrowid
+                    for sku, product_id, name, quantity, price in line_items:
+                        conn.execute(
+                            "INSERT INTO sale_items(sale_id,product_id,sku,product_name,quantity,unit_price,subtotal) "
+                            "VALUES(?,?,?,?,?,?,?)",
+                            (sale_id, product_id, sku, name, quantity, price, round(quantity * price, 2)),
+                        )
+                    added_sales += 1
+                    added_total += total
+            conn.commit()
+            return added_sales, round(added_total, 2)
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def record_sale(cart, customer, payment_method):
     if not cart:
         raise ValueError("Agrega al menos un producto a la venta.")
@@ -362,6 +420,7 @@ with tab_dashboard:
         available_months,
         index=0,
         format_func=lambda value: f"{month_names[int(value[5:7]) - 1].capitalize()} {value[:4]}",
+        key=f"dashboard_month_{available_months[0]}",
     )
     year, month = (int(part) for part in month_choice.split("-"))
     month_start = date(year, month, 1)
@@ -374,6 +433,9 @@ with tab_dashboard:
     stock_value = float((products["Stock"] * products["Precio compra"]).sum()) if not products.empty else 0.0
     low = products[products["Stock"] <= products["Stock mínimo"]] if not products.empty else products
 
+    expected_demo_skus = {f"ELE-{number:03d}" for number in range(1, 11)}
+    demo_skus_match = not products.empty and set(products["SKU"].astype(str)) == expected_demo_skus
+    demo_months = set(sales_all["sold_at"].dropna().str[:7]) if not sales_all.empty else set()
     if products.empty and sales_all.empty:
         st.info("La app está vacía. Puedes cargar una demostración ficticia de accesorios eléctricos.")
         if st.button("Cargar demo de accesorios eléctricos · agosto 2026", type="primary"):
@@ -383,13 +445,34 @@ with tab_dashboard:
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
+    elif demo_skus_match and demo_months == {"2026-08"}:
+        st.info("La demo solo incluye agosto. Puedes completarla con datos simulados de enero a septiembre de 2026.")
+        if st.button("Completar demo · enero a septiembre 2026", type="primary"):
+            try:
+                added_sales, added_total = extend_demo_through_today()
+                st.session_state["demo_loaded_notice"] = f"Demo ampliada: {added_sales} ventas añadidas por ${added_total:,.2f}; ya incluye enero–septiembre 2026."
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+    elif demo_skus_match:
+        st.caption("Datos ficticios de demostración; no representan ventas reales.")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Productos registrados", f"{len(products):,}")
     c2.metric("Unidades en inventario", f"{stock_units:,}")
     c3.metric(f"Ventas · {month_label}", f"${revenue_month:,.2f}")
     c4.metric("Productos con stock bajo", f"{len(low):,}")
-    st.caption(f"Valor del inventario al costo: ${stock_value:,.2f} · Datos de ventas del mes seleccionado")
+    cumulative_sales = float(sales_all["total"].sum()) if not sales_all.empty else 0.0
+    last_sale_date = pd.to_datetime(sales_all["sold_at"]).max().date() if not sales_all.empty else today
+    st.caption(f"Ventas acumuladas hasta {last_sale_date:%d/%m/%Y}: ${cumulative_sales:,.2f} · Valor del inventario al costo: ${stock_value:,.2f}")
+    st.subheader("Ventas por mes hasta hoy")
+    if not sales_all.empty:
+        monthly_chart = sales_all.copy()
+        monthly_chart["Mes"] = pd.to_datetime(monthly_chart["sold_at"]).dt.strftime("%Y-%m")
+        monthly_totals = monthly_chart.groupby("Mes", as_index=True)["total"].sum().to_frame("Ventas USD")
+        st.bar_chart(monthly_totals)
+    else:
+        st.info("El gráfico mensual aparecerá cuando registres ventas.")
     left, right = st.columns(2)
     with left:
         st.subheader(f"Ventas por semana · {month_label}")
