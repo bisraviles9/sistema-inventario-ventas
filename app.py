@@ -502,7 +502,7 @@ with tab_sales:
                     st.rerun()
     st.divider()
     st.subheader("Historial de ventas")
-    start_date, end_date = st.date_input("Filtrar fechas", value=(month_start, month_end), key="sales_dates")
+    start_date, end_date = st.date_input("Filtrar fechas", value=(month_start, month_end), key=f"sales_dates_{month_choice}")
     sales = read_sales(start_date, end_date)
     if sales.empty:
         st.info("No hay ventas en ese rango de fechas.")
@@ -524,7 +524,7 @@ with tab_excel:
             st.error(f"No se pudo importar el archivo: {exc}")
     st.divider()
     st.subheader("Exportar reportes")
-    export_start, export_end = st.date_input("Rango para ventas exportadas", value=(month_start, month_end), key="export_dates")
+    export_start, export_end = st.date_input("Rango para ventas exportadas", value=(month_start, month_end), key=f"export_dates_{month_choice}")
     workbook = make_export(export_start, export_end)
     st.download_button("Descargar reporte Excel", data=workbook, file_name=f"reporte_inventario_{date.today().isoformat()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.caption("El Excel incluye hojas de Productos, Ventas, Detalle de ventas y Stock bajo.")
